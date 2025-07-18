@@ -7,8 +7,8 @@
 #define LED_COUNT  1   // LED数量
 
 // 配置网络和巴法云参数
-const char* ssid = "Xiaomi";
-const char* password = "18166334677";
+const char* ssid = "Xiaomi";   // wifi name
+const char* password = "18166334677"; // wifi passwords
 const char* mqtt_server = "bemfa.com"; // 巴法云MQTT地址
 const int mqtt_port = 9501;            // 端口号
 const char* uid = "79fa744a49ad461cb25cc83a2ee6c01a";            // 用户密钥
