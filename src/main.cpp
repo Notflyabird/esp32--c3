@@ -2,7 +2,7 @@
  * ESP32-S3 N16R8 + INMP441 + ESP-SR
  *
  * INMP441: SCK=GPIO4, WS=GPIO5, SD=GPIO6, L/R=GND
- * Output:  GPIO10, active high
+ * Output:  onboard addressable RGB LED, GPIO48 on DevKitC-1 v1.0
  * Flow:    AFE -> "Hi ESP" WakeNet -> Chinese/English MultiNet -> GPIO
  */
 
@@ -11,8 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "driver/gpio.h"
 #include "driver/i2s.h"
+#include "driver/rmt_tx.h"
 #include "esp_afe_config.h"
 #include "esp_afe_sr_iface.h"
 #include "esp_afe_sr_models.h"
@@ -32,10 +32,12 @@ static const char *TAG = "VOICE_LIGHT";
 #define PIN_BCLK GPIO_NUM_4
 #define PIN_WS GPIO_NUM_5
 #define PIN_SD GPIO_NUM_6
-#define LED_GPIO GPIO_NUM_10
+#define RGB_LED_GPIO GPIO_NUM_48
 #define SAMPLE_RATE 16000
 #define MIC_SAMPLE_SHIFT 14
 #define COMMAND_TIMEOUT_MS 6000
+#define RGB_RMT_RESOLUTION_HZ 10000000
+#define RGB_ON_BRIGHTNESS 48
 
 enum command_id_t {
     COMMAND_LIGHT_ON = 0,
@@ -57,6 +59,82 @@ typedef struct {
 } speech_context_t;
 
 static speech_context_t s_speech = {};
+static rmt_channel_handle_t s_rgb_channel = NULL;
+static rmt_encoder_handle_t s_rgb_encoder = NULL;
+
+static const rmt_symbol_word_t WS2812_ZERO = {
+    .duration0 = 3,
+    .level0 = 1,
+    .duration1 = 9,
+    .level1 = 0,
+};
+
+static const rmt_symbol_word_t WS2812_ONE = {
+    .duration0 = 9,
+    .level0 = 1,
+    .duration1 = 3,
+    .level1 = 0,
+};
+
+static const rmt_symbol_word_t WS2812_RESET = {
+    .duration0 = 250,
+    .level0 = 0,
+    .duration1 = 250,
+    .level1 = 0,
+};
+
+static size_t rgb_encoder_callback(const void *data, size_t data_size,
+                                   size_t symbols_written, size_t symbols_free,
+                                   rmt_symbol_word_t *symbols, bool *done, void *arg)
+{
+    (void)arg;
+    if (symbols_free < 8) {
+        return 0;
+    }
+
+    const size_t data_pos = symbols_written / 8;
+    const uint8_t *bytes = (const uint8_t *)data;
+    if (data_pos < data_size) {
+        size_t symbol_pos = 0;
+        for (uint8_t mask = 0x80; mask != 0; mask >>= 1) {
+            symbols[symbol_pos++] = (bytes[data_pos] & mask) ? WS2812_ONE : WS2812_ZERO;
+        }
+        return symbol_pos;
+    }
+
+    symbols[0] = WS2812_RESET;
+    *done = true;
+    return 1;
+}
+
+static void rgb_led_set(uint8_t red, uint8_t green, uint8_t blue)
+{
+    // The onboard WS2812-compatible LED expects GRB byte order.
+    const uint8_t pixel[] = {green, red, blue};
+    rmt_transmit_config_t tx_config = {};
+    tx_config.loop_count = 0;
+    ESP_ERROR_CHECK(rmt_transmit(s_rgb_channel, s_rgb_encoder,
+                                 pixel, sizeof(pixel), &tx_config));
+    ESP_ERROR_CHECK(rmt_tx_wait_all_done(s_rgb_channel, portMAX_DELAY));
+}
+
+static void rgb_led_init(void)
+{
+    rmt_tx_channel_config_t channel_config = {};
+    channel_config.gpio_num = RGB_LED_GPIO;
+    channel_config.clk_src = RMT_CLK_SRC_DEFAULT;
+    channel_config.resolution_hz = RGB_RMT_RESOLUTION_HZ;
+    channel_config.mem_block_symbols = 64;
+    channel_config.trans_queue_depth = 2;
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&channel_config, &s_rgb_channel));
+
+    rmt_simple_encoder_config_t encoder_config = {};
+    encoder_config.callback = rgb_encoder_callback;
+    encoder_config.min_chunk_size = 64;
+    ESP_ERROR_CHECK(rmt_new_simple_encoder(&encoder_config, &s_rgb_encoder));
+    ESP_ERROR_CHECK(rmt_enable(s_rgb_channel));
+    rgb_led_set(0, 0, 0);
+}
 
 static void *audio_alloc(size_t size)
 {
@@ -244,11 +322,11 @@ static int detect_command(multinet_model_t *model, int16_t *audio, bool *timed_o
 static void apply_light_command(int command)
 {
     if (command == COMMAND_LIGHT_ON) {
-        gpio_set_level(LED_GPIO, 1);
-        ESP_LOGI(TAG, "Light ON");
+        rgb_led_set(RGB_ON_BRIGHTNESS, RGB_ON_BRIGHTNESS, RGB_ON_BRIGHTNESS);
+        ESP_LOGI(TAG, "RGB light ON (white)");
     } else if (command == COMMAND_LIGHT_OFF) {
-        gpio_set_level(LED_GPIO, 0);
-        ESP_LOGI(TAG, "Light OFF");
+        rgb_led_set(0, 0, 0);
+        ESP_LOGI(TAG, "RGB light OFF");
     }
 }
 
@@ -310,9 +388,7 @@ static void detect_task(void *arg)
 
 extern "C" void app_main(void)
 {
-    gpio_reset_pin(LED_GPIO);
-    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(LED_GPIO, 0);
+    rgb_led_init();
     i2s_init();
 
     s_speech.models = esp_srmodel_init("model");
@@ -343,7 +419,7 @@ extern "C" void app_main(void)
     }
 
     ESP_LOGI(TAG, "ESP32-S3 multilingual voice light control");
-    ESP_LOGI(TAG, "INMP441 BCLK=4 WS=5 SD=6, output GPIO=10");
+    ESP_LOGI(TAG, "INMP441 BCLK=4 WS=5 SD=6, RGB LED GPIO=%d", RGB_LED_GPIO);
     s_speech.afe_iface->print_pipeline(s_speech.afe_data);
 
     if (xTaskCreatePinnedToCore(feed_task, "afe_feed", 8192, &s_speech, 5, NULL, 0) != pdPASS ||
