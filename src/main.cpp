@@ -3,7 +3,9 @@
  *
  * INMP441 wiring:
  *   SCK -> GPIO4, WS -> GPIO5, SD -> GPIO6, L/R -> GND
- * Wake word: "Hi ESP" (wn9s_hiesp)
+ * Voice commands:
+ *   "Hi ESP"   -> light on
+ *   "Hi Lexin" -> light off
  */
 
 #include <stdint.h>
@@ -99,6 +101,47 @@ static esp_err_t read_pcm_chunk(int32_t *i2s_buffer, int16_t *pcm_buffer, int sa
     return ESP_OK;
 }
 
+typedef struct {
+    const char *description;
+    const char *expected_name;
+    const esp_wn_iface_t *interface;
+    model_iface_data_t *data;
+} voice_command_model_t;
+
+static bool init_voice_command_model(srmodel_list_t *models,
+                                     const char *filter,
+                                     voice_command_model_t *command)
+{
+    char *model_name = esp_srmodel_filter(models, ESP_WN_PREFIX, filter);
+    if (model_name == NULL || strstr(model_name, command->expected_name) == NULL) {
+        ESP_LOGE(TAG, "%s model %s is missing", command->description, command->expected_name);
+        return false;
+    }
+
+    command->interface = esp_wn_handle_from_name(model_name);
+    if (command->interface == NULL) {
+        ESP_LOGE(TAG, "No WakeNet interface for %s", model_name);
+        return false;
+    }
+
+    command->data = command->interface->create(model_name, DET_MODE_95);
+    if (command->data == NULL) {
+        ESP_LOGE(TAG, "Failed to create WakeNet model %s", model_name);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "%s model ready: %s", command->description, model_name);
+    return true;
+}
+
+static void destroy_voice_command_model(voice_command_model_t *command)
+{
+    if (command->interface != NULL && command->data != NULL) {
+        command->interface->destroy(command->data);
+        command->data = NULL;
+    }
+}
+
 static void detection_task(void *arg)
 {
     (void)arg;
@@ -110,38 +153,40 @@ static void detection_task(void *arg)
         return;
     }
 
-    char *model_name = esp_srmodel_filter(models, ESP_WN_PREFIX, "hiesp");
-    if (model_name == NULL || strstr(model_name, "wn9s_hiesp") == NULL) {
-        ESP_LOGE(TAG, "WakeNet9s Hi ESP model is not present in the model partition");
+    voice_command_model_t light_on = {
+        .description = "Light-on",
+        .expected_name = "wn9s_hiesp",
+        .interface = NULL,
+        .data = NULL,
+    };
+    voice_command_model_t light_off = {
+        .description = "Light-off",
+        .expected_name = "wn9s_hilexin",
+        .interface = NULL,
+        .data = NULL,
+    };
+
+    if (!init_voice_command_model(models, "hiesp", &light_on) ||
+        !init_voice_command_model(models, "hilexin", &light_off)) {
+        destroy_voice_command_model(&light_off);
+        destroy_voice_command_model(&light_on);
         esp_srmodel_deinit(models);
         vTaskDelete(NULL);
         return;
     }
 
-    const esp_wn_iface_t *wakenet = esp_wn_handle_from_name(model_name);
-    if (wakenet == NULL) {
-        ESP_LOGE(TAG, "No WakeNet interface for model %s", model_name);
+    const int on_chunk_samples = light_on.interface->get_samp_chunksize(light_on.data);
+    const int off_chunk_samples = light_off.interface->get_samp_chunksize(light_off.data);
+    if (on_chunk_samples <= 0 || on_chunk_samples != off_chunk_samples) {
+        ESP_LOGE(TAG, "Incompatible model chunks: on=%d off=%d",
+                 on_chunk_samples, off_chunk_samples);
+        destroy_voice_command_model(&light_off);
+        destroy_voice_command_model(&light_on);
         esp_srmodel_deinit(models);
         vTaskDelete(NULL);
         return;
     }
-
-    model_iface_data_t *model_data = wakenet->create(model_name, DET_MODE_95);
-    if (model_data == NULL) {
-        ESP_LOGE(TAG, "Failed to create WakeNet model %s", model_name);
-        esp_srmodel_deinit(models);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    const int chunk_samples = wakenet->get_samp_chunksize(model_data);
-    if (chunk_samples <= 0) {
-        ESP_LOGE(TAG, "Invalid WakeNet chunk size: %d", chunk_samples);
-        wakenet->destroy(model_data);
-        esp_srmodel_deinit(models);
-        vTaskDelete(NULL);
-        return;
-    }
+    const int chunk_samples = on_chunk_samples;
 
     int16_t *pcm_buffer = (int16_t *)malloc((size_t)chunk_samples * sizeof(*pcm_buffer));
     int32_t *i2s_buffer = (int32_t *)malloc((size_t)chunk_samples * sizeof(*i2s_buffer));
@@ -149,15 +194,16 @@ static void detection_task(void *arg)
         ESP_LOGE(TAG, "Failed to allocate audio buffers (chunk=%d)", chunk_samples);
         free(i2s_buffer);
         free(pcm_buffer);
-        wakenet->destroy(model_data);
+        destroy_voice_command_model(&light_off);
+        destroy_voice_command_model(&light_on);
         esp_srmodel_deinit(models);
         vTaskDelete(NULL);
         return;
     }
 
     i2s_init();
-    ESP_LOGI(TAG, "Model %s ready, chunk=%d samples", model_name, chunk_samples);
-    ESP_LOGI(TAG, "Listening for \"Hi ESP\"");
+    ESP_LOGI(TAG, "Audio chunk=%d samples", chunk_samples);
+    ESP_LOGI(TAG, "Say \"Hi ESP\" to turn on, \"Hi Lexin\" to turn off");
 
     int64_t last_wake_us = 0;
     while (true) {
@@ -167,8 +213,9 @@ static void detection_task(void *arg)
             continue;
         }
 
-        wakenet_state_t state = wakenet->detect(model_data, pcm_buffer);
-        if (state != WAKENET_DETECTED) {
+        wakenet_state_t on_state = light_on.interface->detect(light_on.data, pcm_buffer);
+        wakenet_state_t off_state = light_off.interface->detect(light_off.data, pcm_buffer);
+        if (on_state != WAKENET_DETECTED && off_state != WAKENET_DETECTED) {
             continue;
         }
 
@@ -178,10 +225,13 @@ static void detection_task(void *arg)
         }
         last_wake_us = now;
 
-        gpio_set_level(LED_GPIO, 1);
-        ESP_LOGI(TAG, "Hi ESP detected");
-        vTaskDelay(pdMS_TO_TICKS(150));
-        gpio_set_level(LED_GPIO, 0);
+        if (on_state == WAKENET_DETECTED) {
+            gpio_set_level(LED_GPIO, 1);
+            ESP_LOGI(TAG, "Hi ESP detected: light ON");
+        } else {
+            gpio_set_level(LED_GPIO, 0);
+            ESP_LOGI(TAG, "Hi Lexin detected: light OFF");
+        }
     }
 }
 
@@ -191,7 +241,7 @@ extern "C" void app_main(void)
     gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_level(LED_GPIO, 0);
 
-    ESP_LOGI(TAG, "ESP32-C3 WakeNet9s direct inference");
+    ESP_LOGI(TAG, "ESP32-C3 WakeNet9s light control");
     ESP_LOGI(TAG, "INMP441: BCLK=GPIO4 WS=GPIO5 SD=GPIO6");
 
     BaseType_t created = xTaskCreatePinnedToCore(

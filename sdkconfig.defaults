@@ -1,5 +1,6 @@
-# ESP-SR: package only the C3-compatible WakeNet9s "Hi ESP" model.
+# ESP-SR: package two C3-compatible WakeNet9s command models.
 CONFIG_SR_WN_WN9S_HIESP=y
+CONFIG_SR_WN_WN9S_HILEXIN=y
 
 # The legacy I2S API is used by this small example.
 CONFIG_I2S_SUPPRESS_DEPRECATE_WARN=y
