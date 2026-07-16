@@ -1,5 +1,5 @@
 /*
- * ESP32-S3 + INMP441 + ESP-SR offline voice scoring for Dou Dizhu.
+ * ESP32-S3 + INMP441 + ESP-SR offline voice scorekeeper for Dou Dizhu.
  *
  * INMP441 wiring:
  *   SCK/BCLK = GPIO4, WS/LRCLK = GPIO5, SD = GPIO6, L/R = GND
@@ -9,6 +9,7 @@
  */
 
 #include <limits.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,16 +39,9 @@ static const char *TAG = "DDZ_SCORE";
 #define MIC_SAMPLE_SHIFT 14
 #define COMMAND_TIMEOUT_MS 6000
 
-typedef enum {
-    CMD_P1_LANDLORD_WIN = 1,
-    CMD_P2_LANDLORD_WIN,
-    CMD_P3_LANDLORD_WIN,
-    CMD_P1_LANDLORD_LOSE,
-    CMD_P2_LANDLORD_LOSE,
-    CMD_P3_LANDLORD_LOSE,
-    CMD_QUERY_SCORE,
-    CMD_RESET_SCORE,
-} command_id_t;
+#define CMD_QUERY_SCORE 1
+#define CMD_RESET_SCORE 2
+#define CMD_SCORE_BASE 100
 
 typedef struct {
     const char *language;
@@ -62,8 +56,32 @@ typedef struct {
     multinet_model_t chinese;
 } speech_context_t;
 
+typedef struct {
+    const char *spoken;
+    int points;
+} point_phrase_t;
+
 static speech_context_t s_speech;
 static int s_score[3] = {0, 0, 0};
+
+static const char *const PLAYER_PHRASES[3] = {
+    "yi hao",
+    "er hao",
+    "san hao",
+};
+
+static const point_phrase_t POINT_PHRASES[] = {
+    {"liang fen", 2},
+    {"si fen", 4},
+    {"liu fen", 6},
+    {"ba fen", 8},
+    {"shi fen", 10},
+    {"shi er fen", 12},
+    {"shi si fen", 14},
+    {"shi liu fen", 16},
+    {"shi ba fen", 18},
+    {"er shi fen", 20},
+};
 
 static int score_total(void)
 {
@@ -72,7 +90,7 @@ static int score_total(void)
 
 static void print_scores(const char *title)
 {
-    ESP_LOGI(TAG, "%s: 1号=%d, 2号=%d, 3号=%d, 总分=%d",
+    ESP_LOGI(TAG, "%s: P1=%d, P2=%d, P3=%d, total=%d",
              title, s_score[0], s_score[1], s_score[2], score_total());
 }
 
@@ -81,63 +99,81 @@ static void reset_scores(void)
     s_score[0] = 0;
     s_score[1] = 0;
     s_score[2] = 0;
-    ESP_LOGI(TAG, "已重置所有分数");
-    print_scores("重置后");
+    ESP_LOGI(TAG, "All scores reset");
+    print_scores("After reset");
 }
 
-static void settle_round(int landlord, bool landlord_win)
+static int make_score_command_id(int player, bool landlord_win, int points)
+{
+    const int player_index = player - 1;
+    const int outcome_index = landlord_win ? 0 : 1;
+    const int point_index = points / 2 - 1;
+    return CMD_SCORE_BASE + player_index * 20 + outcome_index * 10 + point_index;
+}
+
+static bool parse_score_command_id(int command, int *player, bool *landlord_win, int *points)
+{
+    int value = command - CMD_SCORE_BASE;
+    if (value < 0 || value >= 60) {
+        return false;
+    }
+
+    const int player_index = value / 20;
+    value %= 20;
+    const int outcome_index = value / 10;
+    const int point_index = value % 10;
+
+    *player = player_index + 1;
+    *landlord_win = (outcome_index == 0);
+    *points = (point_index + 1) * 2;
+    return true;
+}
+
+static void settle_round(int landlord, bool landlord_win, int points)
 {
     const int before[3] = {s_score[0], s_score[1], s_score[2]};
-    const int landlord_delta = landlord_win ? 2 : -2;
-    const int farmer_delta = landlord_win ? -1 : 1;
+    const int landlord_delta = landlord_win ? points : -points;
+    const int farmer_delta = landlord_win ? -(points / 2) : (points / 2);
     const int landlord_index = landlord - 1;
 
-    ESP_LOGI(TAG, "结算指令: %d号地主%s两分", landlord, landlord_win ? "赢" : "输");
-    ESP_LOGI(TAG, "变更前: 1号=%d, 2号=%d, 3号=%d, 总分=%d",
+    ESP_LOGI(TAG, "Command: P%d landlord %s %d points",
+             landlord, landlord_win ? "wins" : "loses", points);
+    ESP_LOGI(TAG, "Before: P1=%d, P2=%d, P3=%d, total=%d",
              before[0], before[1], before[2], before[0] + before[1] + before[2]);
 
     for (int i = 0; i < 3; ++i) {
         s_score[i] += (i == landlord_index) ? landlord_delta : farmer_delta;
     }
 
-    ESP_LOGI(TAG, "本局变化: 1号=%+d, 2号=%+d, 3号=%+d",
+    ESP_LOGI(TAG, "Delta: P1=%+d, P2=%+d, P3=%+d",
              s_score[0] - before[0], s_score[1] - before[1], s_score[2] - before[2]);
-    print_scores("变更后");
+    print_scores("After");
 
     if (score_total() != 0) {
-        ESP_LOGE(TAG, "总分校验失败，请检查计分逻辑");
+        ESP_LOGE(TAG, "Total check failed");
     }
 }
 
 static void apply_score_command(int command)
 {
+    int player = 0;
+    int points = 0;
+    bool landlord_win = false;
+
+    if (parse_score_command_id(command, &player, &landlord_win, &points)) {
+        settle_round(player, landlord_win, points);
+        return;
+    }
+
     switch (command) {
-    case CMD_P1_LANDLORD_WIN:
-        settle_round(1, true);
-        break;
-    case CMD_P2_LANDLORD_WIN:
-        settle_round(2, true);
-        break;
-    case CMD_P3_LANDLORD_WIN:
-        settle_round(3, true);
-        break;
-    case CMD_P1_LANDLORD_LOSE:
-        settle_round(1, false);
-        break;
-    case CMD_P2_LANDLORD_LOSE:
-        settle_round(2, false);
-        break;
-    case CMD_P3_LANDLORD_LOSE:
-        settle_round(3, false);
-        break;
     case CMD_QUERY_SCORE:
-        print_scores("查询分数");
+        print_scores("Query");
         break;
     case CMD_RESET_SCORE:
         reset_scores();
         break;
     default:
-        ESP_LOGW(TAG, "未知命令ID: %d", command);
+        ESP_LOGW(TAG, "Unknown command id: %d", command);
         break;
     }
 }
@@ -213,40 +249,54 @@ static esp_err_t read_pcm_chunk(int32_t *raw, int16_t *pcm, int sample_count)
     return ESP_OK;
 }
 
-static bool add_command_checked(esp_err_t err, const char *phrase)
+static bool add_command_checked(esp_err_t err, int command_id, const char *phrase)
 {
     if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Add command %d: %s", command_id, phrase);
         return true;
     }
-    ESP_LOGE(TAG, "命令添加失败 [%s]: %s", phrase, esp_err_to_name(err));
+    ESP_LOGE(TAG, "Failed to add command [%s]: %s", phrase, esp_err_to_name(err));
     return false;
+}
+
+static bool add_score_command(multinet_model_t *model, int player, bool landlord_win,
+                              int points, const char *point_phrase)
+{
+    char command_phrase[64];
+    const int command_id = make_score_command_id(player, landlord_win, points);
+
+    snprintf(command_phrase, sizeof(command_phrase), "%s di zhu %s %s",
+             PLAYER_PHRASES[player - 1], landlord_win ? "ying" : "shu", point_phrase);
+
+    return add_command_checked(esp_mn_commands_add(command_id, command_phrase),
+                               command_id, command_phrase);
 }
 
 static bool configure_chinese_commands(multinet_model_t *model)
 {
     ESP_ERROR_CHECK(esp_mn_commands_alloc(model->iface, model->data));
 
-    bool ok =
-        add_command_checked(esp_mn_commands_add(CMD_P1_LANDLORD_WIN, "yi hao di zhu ying liang fen"),
-                            "一号地主赢两分") &&
-        add_command_checked(esp_mn_commands_add(CMD_P2_LANDLORD_WIN, "er hao di zhu ying liang fen"),
-                            "二号地主赢两分") &&
-        add_command_checked(esp_mn_commands_add(CMD_P3_LANDLORD_WIN, "san hao di zhu ying liang fen"),
-                            "三号地主赢两分") &&
-        add_command_checked(esp_mn_commands_add(CMD_P1_LANDLORD_LOSE, "yi hao di zhu shu liang fen"),
-                            "一号地主输两分") &&
-        add_command_checked(esp_mn_commands_add(CMD_P2_LANDLORD_LOSE, "er hao di zhu shu liang fen"),
-                            "二号地主输两分") &&
-        add_command_checked(esp_mn_commands_add(CMD_P3_LANDLORD_LOSE, "san hao di zhu shu liang fen"),
-                            "三号地主输两分") &&
-        add_command_checked(esp_mn_commands_add(CMD_QUERY_SCORE, "cha xun fen shu"),
-                            "查询分数") &&
-        add_command_checked(esp_mn_commands_add(CMD_RESET_SCORE, "chong zhi suo you fen shu"),
-                            "重置所有分数");
+    bool ok = true;
+    for (int player = 1; player <= 3 && ok; ++player) {
+        for (size_t i = 0; i < sizeof(POINT_PHRASES) / sizeof(POINT_PHRASES[0]) && ok; ++i) {
+            ok = add_score_command(model, player, true,
+                                   POINT_PHRASES[i].points, POINT_PHRASES[i].spoken);
+            if (ok) {
+                ok = add_score_command(model, player, false,
+                                       POINT_PHRASES[i].points, POINT_PHRASES[i].spoken);
+            }
+        }
+    }
+
+    ok = ok &&
+         add_command_checked(esp_mn_commands_add(CMD_QUERY_SCORE, "cha xun fen shu"),
+                             CMD_QUERY_SCORE, "cha xun fen shu") &&
+         add_command_checked(esp_mn_commands_add(CMD_RESET_SCORE, "chong zhi suo you fen shu"),
+                             CMD_RESET_SCORE, "chong zhi suo you fen shu");
 
     esp_mn_error_t *errors = ok ? esp_mn_commands_update() : NULL;
     if (errors != NULL) {
-        ESP_LOGE(TAG, "命令词更新失败，请检查拼音命令词");
+        ESP_LOGE(TAG, "Command update failed; check pinyin command words");
         ok = false;
     }
 
@@ -258,7 +308,7 @@ static bool init_chinese_multinet(srmodel_list_t *models, multinet_model_t *mode
 {
     char *model_name = esp_srmodel_filter(models, ESP_MN_PREFIX, ESP_MN_CHINESE);
     if (model_name == NULL) {
-        ESP_LOGE(TAG, "缺少中文 MultiNet 模型");
+        ESP_LOGE(TAG, "Chinese MultiNet model is missing");
         return false;
     }
 
@@ -266,7 +316,7 @@ static bool init_chinese_multinet(srmodel_list_t *models, multinet_model_t *mode
     model->iface = esp_mn_handle_from_name(model_name);
     model->data = model->iface != NULL ? model->iface->create(model_name, COMMAND_TIMEOUT_MS) : NULL;
     if (model->data == NULL) {
-        ESP_LOGE(TAG, "中文 MultiNet 创建失败: %s", model_name);
+        ESP_LOGE(TAG, "Failed to create Chinese MultiNet: %s", model_name);
         return false;
     }
 
@@ -276,7 +326,7 @@ static bool init_chinese_multinet(srmodel_list_t *models, multinet_model_t *mode
         return false;
     }
 
-    ESP_LOGI(TAG, "中文命令已加载: %s", model_name);
+    ESP_LOGI(TAG, "Chinese commands ready: %s", model_name);
     return true;
 }
 
@@ -287,7 +337,7 @@ static void feed_task(void *arg)
     const int channels = speech->afe_iface->get_feed_channel_num(speech->afe_data);
 
     if (chunk <= 0 || channels != 1) {
-        ESP_LOGE(TAG, "不支持的 AFE 输入: chunk=%d channels=%d", chunk, channels);
+        ESP_LOGE(TAG, "Unsupported AFE input: chunk=%d channels=%d", chunk, channels);
         vTaskDelete(NULL);
         return;
     }
@@ -295,7 +345,7 @@ static void feed_task(void *arg)
     int32_t *raw = (int32_t *)audio_alloc((size_t)chunk * sizeof(*raw));
     int16_t *pcm = (int16_t *)audio_alloc((size_t)chunk * sizeof(*pcm));
     if (raw == NULL || pcm == NULL) {
-        ESP_LOGE(TAG, "AFE feed 缓冲区分配失败");
+        ESP_LOGE(TAG, "Failed to allocate AFE feed buffers");
         free(raw);
         free(pcm);
         vTaskDelete(NULL);
@@ -308,7 +358,7 @@ static void feed_task(void *arg)
         if (err == ESP_OK) {
             speech->afe_iface->feed(speech->afe_data, pcm);
         } else {
-            ESP_LOGW(TAG, "I2S 读取失败: %s", esp_err_to_name(err));
+            ESP_LOGW(TAG, "I2S read failed: %s", esp_err_to_name(err));
         }
     }
 }
@@ -341,19 +391,19 @@ static void detect_task(void *arg)
     const int mn_chunk = speech->chinese.iface->get_samp_chunksize(speech->chinese.data);
 
     if (afe_chunk != mn_chunk) {
-        ESP_LOGE(TAG, "Chunk 不匹配: AFE=%d MN=%d", afe_chunk, mn_chunk);
+        ESP_LOGE(TAG, "Chunk mismatch: AFE=%d MN=%d", afe_chunk, mn_chunk);
         vTaskDelete(NULL);
         return;
     }
 
     bool command_session = false;
     bool timed_out = false;
-    ESP_LOGI(TAG, "先说唤醒词 Hi ESP，再说斗地主计分命令");
+    ESP_LOGI(TAG, "Say Hi ESP first, then say a Dou Dizhu scoring command");
 
     while (true) {
         afe_fetch_result_t *result = speech->afe_iface->fetch(speech->afe_data);
         if (result == NULL || result->ret_value == ESP_FAIL) {
-            ESP_LOGW(TAG, "AFE fetch 失败");
+            ESP_LOGW(TAG, "AFE fetch failed");
             continue;
         }
 
@@ -362,7 +412,7 @@ static void detect_task(void *arg)
             speech->afe_iface->disable_wakenet(speech->afe_data);
             command_session = true;
             timed_out = false;
-            ESP_LOGI(TAG, "已唤醒，开始监听命令");
+            ESP_LOGI(TAG, "Wake word detected; listening for command");
         }
 
         if (!command_session) {
@@ -378,7 +428,7 @@ static void detect_task(void *arg)
         } else if (timed_out) {
             speech->afe_iface->enable_wakenet(speech->afe_data);
             command_session = false;
-            ESP_LOGI(TAG, "命令超时，重新等待唤醒词");
+            ESP_LOGI(TAG, "Command timeout; waiting for wake word");
         }
     }
 }
@@ -389,13 +439,13 @@ void app_main(void)
 
     s_speech.models = esp_srmodel_init("model");
     if (s_speech.models == NULL) {
-        ESP_LOGE(TAG, "模型分区加载失败");
+        ESP_LOGE(TAG, "Failed to load model partition");
         return;
     }
 
     afe_config_t *afe_config = afe_config_init("M", s_speech.models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
     if (afe_config == NULL) {
-        ESP_LOGE(TAG, "AFE 配置创建失败");
+        ESP_LOGE(TAG, "Failed to create AFE config");
         return;
     }
 
@@ -410,17 +460,17 @@ void app_main(void)
 
     if (s_speech.afe_data == NULL ||
         !init_chinese_multinet(s_speech.models, &s_speech.chinese)) {
-        ESP_LOGE(TAG, "语音识别初始化失败");
+        ESP_LOGE(TAG, "Speech recognition initialization failed");
         return;
     }
 
-    ESP_LOGI(TAG, "ESP32-S3 ESP-SR 斗地主计分器启动");
-    ESP_LOGI(TAG, "单麦 INMP441: BCLK=%d WS=%d SD=%d", PIN_BCLK, PIN_WS, PIN_SD);
-    print_scores("初始分数");
+    ESP_LOGI(TAG, "ESP32-S3 ESP-SR Dou Dizhu scorekeeper started");
+    ESP_LOGI(TAG, "Single mic INMP441: BCLK=%d WS=%d SD=%d", PIN_BCLK, PIN_WS, PIN_SD);
+    print_scores("Initial");
     s_speech.afe_iface->print_pipeline(s_speech.afe_data);
 
     if (xTaskCreatePinnedToCore(feed_task, "afe_feed", 8192, &s_speech, 5, NULL, 0) != pdPASS ||
         xTaskCreatePinnedToCore(detect_task, "sr_detect", 12288, &s_speech, 5, NULL, 1) != pdPASS) {
-        ESP_LOGE(TAG, "语音任务创建失败");
+        ESP_LOGE(TAG, "Failed to create speech tasks");
     }
 }

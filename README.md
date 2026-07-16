@@ -13,16 +13,62 @@ No speaker, TTS, NVS storage, display, or LED output is used. All score state is
 
 ## Voice Commands
 
-Say `Hi ESP`, then use one command within six seconds:
+Say `Hi ESP`, then use one command within six seconds.
 
-- `yi hao di zhu ying liang fen` / 一号地主赢两分
-- `er hao di zhu ying liang fen` / 二号地主赢两分
-- `san hao di zhu ying liang fen` / 三号地主赢两分
-- `yi hao di zhu shu liang fen` / 一号地主输两分
-- `er hao di zhu shu liang fen` / 二号地主输两分
-- `san hao di zhu shu liang fen` / 三号地主输两分
-- `cha xun fen shu` / 查询分数
-- `chong zhi suo you fen shu` / 重置所有分数
+Scoring command format:
+
+```text
+<player> di zhu <result> <points> fen
+```
+
+Players:
+
+- `yi hao`
+- `er hao`
+- `san hao`
+
+Results:
+
+- `ying`
+- `shu`
+
+Supported point phrases:
+
+- `liang fen`
+- `si fen`
+- `liu fen`
+- `ba fen`
+- `shi fen`
+- `shi er fen`
+- `shi si fen`
+- `shi liu fen`
+- `shi ba fen`
+- `er shi fen`
+
+Examples:
+
+- `yi hao di zhu ying liang fen`
+- `er hao di zhu shu ba fen`
+- `san hao di zhu ying er shi fen`
+
+Other commands:
+
+- `cha xun fen shu`
+- `chong zhi suo you fen shu`
+
+## Scoring
+
+If player X landlord wins N points:
+
+- Player X: `+N`
+- Other two players: `-N/2` each
+
+If player X landlord loses N points:
+
+- Player X: `-N`
+- Other two players: `+N/2` each
+
+Supported N values are 2, 4, 6, 8, 10, 12, 14, 16, 18, and 20.
 
 ## Build And Flash
 
