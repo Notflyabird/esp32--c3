@@ -1,192 +1,202 @@
-#include <Arduino.h>
-#include "driver/i2s.h"
-
 /*
-  ESP32-C3 + INMP441 I2S digital microphone test
+ * ESP32-C3 + INMP441 + ESP-SR WakeNet9s
+ *
+ * INMP441 wiring:
+ *   SCK -> GPIO4, WS -> GPIO5, SD -> GPIO6, L/R -> GND
+ * Wake word: "Hi ESP" (wn9s_hiesp)
+ */
 
-  Default wiring:
-    INMP441 VDD -> 3V3
-    INMP441 GND -> GND
-    INMP441 SCK -> GPIO4
-    INMP441 WS  -> GPIO5
-    INMP441 SD  -> GPIO6
-    INMP441 L/R -> GND  (left channel)
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
-  If L/R is connected to 3V3, change I2S_CHANNEL_FMT_ONLY_LEFT to
-  I2S_CHANNEL_FMT_ONLY_RIGHT in i2s_config.
+#include "driver/gpio.h"
+#include "driver/i2s.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_wn_iface.h"
+#include "esp_wn_models.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "model_path.h"
 
-  Test method:
-    1. Open serial monitor at 115200 baud.
-    2. Keep quiet for 3-5 seconds and watch noise dBFS.
-    3. Speak near the microphone or clap once and watch peak/rms changes.
+static const char *TAG = "WAKE";
 
-  Notes:
-    - INMP441 sensitivity cannot be measured as absolute dB SPL without a
-      calibrated sound source. This sketch reports relative sensitivity in dBFS.
-    - A good microphone should show low stable noise when quiet and a clear
-      increase when speaking or clapping.
-*/
+#define I2S_PORT I2S_NUM_0
+#define PIN_BCLK GPIO_NUM_4
+#define PIN_WS GPIO_NUM_5
+#define PIN_SD GPIO_NUM_6
+#define SAMPLE_RATE 16000
 
-static constexpr i2s_port_t I2S_PORT = I2S_NUM_0;
+#define LED_GPIO GPIO_NUM_10
+#define WAKE_LOCKOUT_MS 1000
 
-static constexpr gpio_num_t PIN_I2S_BCLK = GPIO_NUM_4;
-static constexpr gpio_num_t PIN_I2S_WS = GPIO_NUM_5;
-static constexpr gpio_num_t PIN_I2S_DATA_IN = GPIO_NUM_6;
+// INMP441 outputs 24-bit samples left-aligned in a 32-bit I2S slot.
+// Shifting by 14 converts to 16-bit PCM while adding modest input gain.
+#define MIC_SAMPLE_SHIFT 14
 
-static constexpr uint32_t SAMPLE_RATE_HZ = 16000;
-static constexpr size_t READ_SAMPLES = 512;
-static constexpr uint32_t REPORT_INTERVAL_MS = 1000;
-
-// 24-bit INMP441 samples are delivered left-aligned in a 32-bit I2S word.
-static constexpr float PCM24_FULL_SCALE = 8388608.0f;
-
-static int32_t raw_buffer[READ_SAMPLES];
-
-static float dbfsFromRms(float rms)
+static void i2s_init(void)
 {
-  if (rms <= 1.0f) {
-    return -120.0f;
-  }
-  return 20.0f * log10f(rms / PCM24_FULL_SCALE);
+    i2s_config_t config = {};
+    config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
+    config.sample_rate = SAMPLE_RATE;
+    config.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
+    config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+    config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+    config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+    config.dma_desc_num = 4;
+    config.dma_frame_num = 256;
+
+    i2s_pin_config_t pins = {};
+    pins.bck_io_num = PIN_BCLK;
+    pins.ws_io_num = PIN_WS;
+    pins.data_out_num = I2S_PIN_NO_CHANGE;
+    pins.data_in_num = PIN_SD;
+    pins.mck_io_num = I2S_PIN_NO_CHANGE;
+
+    ESP_ERROR_CHECK(i2s_driver_install(I2S_PORT, &config, 0, NULL));
+    ESP_ERROR_CHECK(i2s_set_pin(I2S_PORT, &pins));
+    ESP_ERROR_CHECK(i2s_zero_dma_buffer(I2S_PORT));
 }
 
-static void installI2S()
+static int16_t sample_to_pcm16(int32_t sample)
 {
-  const i2s_config_t i2s_config = {
-      .mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX),
-      .sample_rate = SAMPLE_RATE_HZ,
-      .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-      .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-      .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-      .dma_buf_count = 4,
-      .dma_buf_len = 256,
-      .use_apll = false,
-      .tx_desc_auto_clear = false,
-      .fixed_mclk = 0,
-  };
-
-  const i2s_pin_config_t pin_config = {
-      .bck_io_num = PIN_I2S_BCLK,
-      .ws_io_num = PIN_I2S_WS,
-      .data_out_num = I2S_PIN_NO_CHANGE,
-      .data_in_num = PIN_I2S_DATA_IN,
-  };
-
-  ESP_ERROR_CHECK(i2s_driver_install(I2S_PORT, &i2s_config, 0, nullptr));
-  ESP_ERROR_CHECK(i2s_set_pin(I2S_PORT, &pin_config));
-  ESP_ERROR_CHECK(i2s_zero_dma_buffer(I2S_PORT));
-}
-
-static const char *qualityText(float quietDbfs, float activeDbfs, float peakDbfs, uint32_t nonZeroSamples)
-{
-  const float responseDb = activeDbfs - quietDbfs;
-
-  if (nonZeroSamples == 0) {
-    return "BAD: no data, check SD/BCLK/WS wiring and power";
-  }
-  if (peakDbfs > -1.0f) {
-    return "WARN: clipping, sound too loud or bit alignment/wiring is wrong";
-  }
-  if (quietDbfs > -20.0f) {
-    return "WARN: noise is very high, check power/GND and wiring";
-  }
-  if (responseDb >= 12.0f) {
-    return "OK: clear acoustic response";
-  }
-  if (responseDb >= 6.0f) {
-    return "WEAK: response is small, speak closer or check mic port direction";
-  }
-  return "WAIT: keep quiet first, then speak/clap near the microphone";
-}
-
-void setup()
-{
-  Serial.begin(115200);
-  delay(1000);
-
-  Serial.println();
-  Serial.println("ESP32-C3 INMP441 microphone test");
-  Serial.println("Pins: BCLK=GPIO4, WS=GPIO5, SD=GPIO6, L/R=GND(left)");
-  Serial.println("Output: rms_dbfs, peak_dbfs, quiet_floor, response_delta, verdict");
-  Serial.println();
-
-  installI2S();
-}
-
-void loop()
-{
-  static uint32_t last_report_ms = 0;
-  static double sum_squares = 0.0;
-  static uint32_t sample_count = 0;
-  static uint32_t non_zero_count = 0;
-  static int32_t peak_abs = 0;
-  static float quiet_floor_dbfs = 0.0f;
-  static bool quiet_floor_ready = false;
-
-  size_t bytes_read = 0;
-  const esp_err_t err = i2s_read(
-      I2S_PORT,
-      raw_buffer,
-      sizeof(raw_buffer),
-      &bytes_read,
-      pdMS_TO_TICKS(100));
-
-  if (err != ESP_OK || bytes_read == 0) {
-    Serial.printf("I2S read error: %d, bytes=%u\n", static_cast<int>(err), static_cast<unsigned>(bytes_read));
-    delay(500);
-    return;
-  }
-
-  const size_t samples_read = bytes_read / sizeof(raw_buffer[0]);
-  for (size_t i = 0; i < samples_read; ++i) {
-    const int32_t sample24 = raw_buffer[i] >> 8;
-    const int32_t abs_sample = abs(sample24);
-
-    sum_squares += static_cast<double>(sample24) * static_cast<double>(sample24);
-    sample_count++;
-
-    if (sample24 != 0) {
-      non_zero_count++;
+    sample >>= MIC_SAMPLE_SHIFT;
+    if (sample > INT16_MAX) {
+        return INT16_MAX;
     }
-    if (abs_sample > peak_abs) {
-      peak_abs = abs_sample;
+    if (sample < INT16_MIN) {
+        return INT16_MIN;
     }
-  }
+    return (int16_t)sample;
+}
 
-  const uint32_t now = millis();
-  if (now - last_report_ms < REPORT_INTERVAL_MS || sample_count == 0) {
-    return;
-  }
-  last_report_ms = now;
+static esp_err_t read_pcm_chunk(int32_t *i2s_buffer, int16_t *pcm_buffer, int sample_count)
+{
+    const size_t requested_bytes = (size_t)sample_count * sizeof(*i2s_buffer);
+    size_t total_bytes = 0;
 
-  const float rms = sqrt(sum_squares / sample_count);
-  const float rms_dbfs = dbfsFromRms(rms);
-  const float peak_dbfs = dbfsFromRms(static_cast<float>(peak_abs));
+    while (total_bytes < requested_bytes) {
+        size_t bytes_read = 0;
+        esp_err_t err = i2s_read(I2S_PORT,
+                                 (uint8_t *)i2s_buffer + total_bytes,
+                                 requested_bytes - total_bytes,
+                                 &bytes_read,
+                                 portMAX_DELAY);
+        if (err != ESP_OK) {
+            return err;
+        }
+        if (bytes_read == 0) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        total_bytes += bytes_read;
+    }
 
-  if (!quiet_floor_ready) {
-    quiet_floor_dbfs = rms_dbfs;
-    quiet_floor_ready = true;
-  } else if (rms_dbfs < quiet_floor_dbfs) {
-    quiet_floor_dbfs = (quiet_floor_dbfs * 0.8f) + (rms_dbfs * 0.2f);
-  }
+    for (int i = 0; i < sample_count; ++i) {
+        pcm_buffer[i] = sample_to_pcm16(i2s_buffer[i]);
+    }
+    return ESP_OK;
+}
 
-  const float response_delta_db = rms_dbfs - quiet_floor_dbfs;
-  const char *verdict = qualityText(quiet_floor_dbfs, rms_dbfs, peak_dbfs, non_zero_count);
+static void detection_task(void *arg)
+{
+    (void)arg;
 
-  Serial.printf(
-      "rms=%8.0f  rms_dbfs=%7.1f  peak_dbfs=%7.1f  quiet=%7.1f  delta=%6.1f  nonzero=%lu/%lu  %s\n",
-      rms,
-      rms_dbfs,
-      peak_dbfs,
-      quiet_floor_dbfs,
-      response_delta_db,
-      static_cast<unsigned long>(non_zero_count),
-      static_cast<unsigned long>(sample_count),
-      verdict);
+    srmodel_list_t *models = esp_srmodel_init("model");
+    if (models == NULL) {
+        ESP_LOGE(TAG, "Unable to load models from the 'model' partition");
+        vTaskDelete(NULL);
+        return;
+    }
 
-  sum_squares = 0.0;
-  sample_count = 0;
-  non_zero_count = 0;
-  peak_abs = 0;
+    char *model_name = esp_srmodel_filter(models, ESP_WN_PREFIX, "hiesp");
+    if (model_name == NULL || strstr(model_name, "wn9s_hiesp") == NULL) {
+        ESP_LOGE(TAG, "WakeNet9s Hi ESP model is not present in the model partition");
+        esp_srmodel_deinit(models);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    const esp_wn_iface_t *wakenet = esp_wn_handle_from_name(model_name);
+    if (wakenet == NULL) {
+        ESP_LOGE(TAG, "No WakeNet interface for model %s", model_name);
+        esp_srmodel_deinit(models);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    model_iface_data_t *model_data = wakenet->create(model_name, DET_MODE_95);
+    if (model_data == NULL) {
+        ESP_LOGE(TAG, "Failed to create WakeNet model %s", model_name);
+        esp_srmodel_deinit(models);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    const int chunk_samples = wakenet->get_samp_chunksize(model_data);
+    if (chunk_samples <= 0) {
+        ESP_LOGE(TAG, "Invalid WakeNet chunk size: %d", chunk_samples);
+        wakenet->destroy(model_data);
+        esp_srmodel_deinit(models);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int16_t *pcm_buffer = (int16_t *)malloc((size_t)chunk_samples * sizeof(*pcm_buffer));
+    int32_t *i2s_buffer = (int32_t *)malloc((size_t)chunk_samples * sizeof(*i2s_buffer));
+    if (pcm_buffer == NULL || i2s_buffer == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate audio buffers (chunk=%d)", chunk_samples);
+        free(i2s_buffer);
+        free(pcm_buffer);
+        wakenet->destroy(model_data);
+        esp_srmodel_deinit(models);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    i2s_init();
+    ESP_LOGI(TAG, "Model %s ready, chunk=%d samples", model_name, chunk_samples);
+    ESP_LOGI(TAG, "Listening for \"Hi ESP\"");
+
+    int64_t last_wake_us = 0;
+    while (true) {
+        esp_err_t err = read_pcm_chunk(i2s_buffer, pcm_buffer, chunk_samples);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "I2S read failed: %s", esp_err_to_name(err));
+            continue;
+        }
+
+        wakenet_state_t state = wakenet->detect(model_data, pcm_buffer);
+        if (state != WAKENET_DETECTED) {
+            continue;
+        }
+
+        const int64_t now = esp_timer_get_time();
+        if (now - last_wake_us <= WAKE_LOCKOUT_MS * 1000LL) {
+            continue;
+        }
+        last_wake_us = now;
+
+        gpio_set_level(LED_GPIO, 1);
+        ESP_LOGI(TAG, "Hi ESP detected");
+        vTaskDelay(pdMS_TO_TICKS(150));
+        gpio_set_level(LED_GPIO, 0);
+    }
+}
+
+extern "C" void app_main(void)
+{
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_GPIO, 0);
+
+    ESP_LOGI(TAG, "ESP32-C3 WakeNet9s direct inference");
+    ESP_LOGI(TAG, "INMP441: BCLK=GPIO4 WS=GPIO5 SD=GPIO6");
+
+    BaseType_t created = xTaskCreatePinnedToCore(
+        detection_task, "wakenet", 8192, NULL, 5, NULL, 0);
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create WakeNet task");
+    }
 }
