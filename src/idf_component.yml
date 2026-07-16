@@ -1,5 +1,4 @@
-## IDF Component Manager Manifest File
-## ESP-SR speech recognition with WakeNet9s for ESP32-C3
+## ESP-SR speech recognition for ESP32-S3
 dependencies:
   espressif/esp-sr: "^2.4.0"
   idf: ">=5.3"
