@@ -38,11 +38,11 @@ Supported point phrases:
 - `si fen`
 - `liu fen`
 - `ba fen`
-- `shi fen`
-- `shi er fen`
-- `shi si fen`
-- `shi liu fen`
-- `shi ba fen`
+- `yi shi fen`
+- `yi shi er fen`
+- `yi shi si fen`
+- `yi shi liu fen`
+- `yi shi ba fen`
 - `er shi fen`
 
 Examples:
